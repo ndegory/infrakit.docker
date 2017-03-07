@@ -11,7 +11,7 @@ import (
 
 const (
 	defaultDockerURL        = "unix:///var/run/docker.sock"
-	defaultDockerAPIVersion = "1.24"
+	defaultDockerAPIVersion = "1.25"
 )
 
 type options struct {

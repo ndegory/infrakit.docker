@@ -4,7 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
+	"os"
+	"path"
 	"sort"
+	"strings"
 
 	log "github.com/Sirupsen/logrus"
 	apitypes "github.com/docker/docker/api/types"
@@ -12,11 +16,18 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/infrakit/pkg/spi"
 	"github.com/docker/infrakit/pkg/spi/instance"
 	"github.com/docker/infrakit/pkg/types"
 	"golang.org/x/net/context"
 )
+
+const (
+	userdataDirname = "/var/lib"
+)
+
+var userdataBasename = "userdata"
 
 type dockerInstancePlugin struct {
 	client        client.Client
@@ -45,11 +56,10 @@ func (p dockerInstancePlugin) tagInstance(
 
 // CreateInstanceRequest is the concrete provision request type.
 type CreateInstanceRequest struct {
-	Tags             map[string]string
-	Config           *container.Config
-	HostConfig       *container.HostConfig
-	NetworkingConfig *network.NetworkingConfig
-	NetworkName      string
+	Tags               map[string]string
+	Config             *container.Config
+	HostConfig         *container.HostConfig
+	NetworkAttachments []*apitypes.NetworkResource
 }
 
 // VendorInfo returns a vendor specific name and version
@@ -73,15 +83,13 @@ func (p dockerInstancePlugin) ExampleProperties() *types.Any {
 		},
 	}
 	hostConfig := container.HostConfig{}
-	networkingConfig := network.NetworkingConfig{}
 	example := CreateInstanceRequest{
 		Tags: map[string]string{
 			"tag1": "value1",
 			"tag2": "value2",
 		},
-		Config:           &config,
-		HostConfig:       &hostConfig,
-		NetworkingConfig: &networkingConfig,
+		Config:     &config,
+		HostConfig: &hostConfig,
 	}
 
 	any, err := types.AnyValue(example)
@@ -113,7 +121,7 @@ func mergeTags(tagMaps ...map[string]string) ([]string, map[string]string) {
 	for _, tagMap := range tagMaps {
 		for k, v := range tagMap {
 			if _, exists := tags[k]; exists {
-				log.Warnf("Ovewriting tag value for key %s", k)
+				log.Warnf("Overwriting tag value for key %s", k)
 			} else {
 				keys = append(keys, k)
 			}
@@ -145,22 +153,6 @@ func (p dockerInstancePlugin) Provision(spec instance.Spec) (*instance.ID, error
 	_, allTags := mergeTags(spec.Tags, request.Tags)
 	request.Config.Labels = allTags
 
-	if spec.LogicalID != nil {
-		if request.NetworkName == "" {
-			request.NetworkName = "bridge"
-		}
-		if request.NetworkingConfig == nil {
-			request.NetworkingConfig = &network.NetworkingConfig{}
-		}
-		if request.NetworkingConfig.EndpointsConfig == nil {
-			request.NetworkingConfig.EndpointsConfig = map[string]*(network.EndpointSettings){}
-		}
-		if request.NetworkingConfig.EndpointsConfig[request.NetworkName] == nil {
-			request.NetworkingConfig.EndpointsConfig[request.NetworkName] = &network.EndpointSettings{}
-		}
-		request.NetworkingConfig.EndpointsConfig[request.NetworkName].IPAddress = (string)(*spec.LogicalID)
-	}
-
 	cli := p.client
 	ctx := context.Background()
 	image := request.Config.Image
@@ -169,20 +161,26 @@ func (p dockerInstancePlugin) Provision(spec instance.Spec) (*instance.ID, error
 	}
 	reader, err := cli.ImagePull(ctx, image, apitypes.ImagePullOptions{})
 	if err != nil {
-		return nil, err
-	}
-	data := make([]byte, 1000, 1000)
-	for {
-		_, err := reader.Read(data)
-		if err != nil {
-			if err.Error() == "EOF" {
-				break
+		// don't exit, if no access to the registry we may still want to run the container
+		log.Warnf("ImagePull failed: %f", err)
+	} else {
+		data := make([]byte, 1000, 1000)
+		for {
+			_, err := reader.Read(data)
+			if err != nil {
+				if err.Error() == "EOF" {
+					break
+				}
+				return nil, err
 			}
-			return nil, err
 		}
 	}
 	containerName := ""
-	r, err := cli.ContainerCreate(ctx, request.Config, request.HostConfig, request.NetworkingConfig, containerName)
+	if spec.LogicalID != nil {
+		containerName = string(*spec.LogicalID)
+	}
+	log.Debugf("Creating a new container (%s)", containerName)
+	r, err := cli.ContainerCreate(ctx, request.Config, request.HostConfig, nil, containerName)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +189,124 @@ func (p dockerInstancePlugin) Provision(spec instance.Spec) (*instance.ID, error
 		return nil, errors.New("Unexpected Docker API response")
 	}
 	id := (instance.ID)(r.ID)
+	log.Debugf("Container ID = %s", r.ID)
 
+	// If a network attachment is specified in the config
+	// attach the container to these networks
+	// if the network do not exist, first create it
+	for _, networkAttachment := range request.NetworkAttachments {
+		if networkAttachment.Name == "" {
+			return nil, errors.New("NetworkAttachment should have a name")
+		}
+		filter := filters.NewArgs()
+		filter.Add("name", networkAttachment.Name)
+		if networkAttachment.Driver != "" {
+			filter.Add("driver", networkAttachment.Driver)
+		}
+		log.Debugf("Attaching container to network %s", networkAttachment.Name)
+		networkListOptions := apitypes.NetworkListOptions{Filters: filter}
+		networkResources, err := cli.NetworkList(ctx, networkListOptions)
+		if err != nil {
+			return nil, err
+		}
+		networkID := ""
+		if len(networkResources) == 0 {
+			// create the network
+			log.Debug("Creating the network")
+			networkCreateOptions := apitypes.NetworkCreate{Driver: networkAttachment.Driver, Attachable: true, CheckDuplicate: true}
+			networkResponse, err := cli.NetworkCreate(ctx, networkAttachment.Name, networkCreateOptions)
+			if err != nil {
+				return nil, err
+			}
+			networkID = networkResponse.ID
+		} else if len(networkResources) == 1 {
+			networkID = networkResources[0].ID
+		} else {
+			return nil, fmt.Errorf("too many (%d) networks found with name %s", len(networkResources), networkAttachment.Name)
+		}
+
+		endpointSettings := network.EndpointSettings{}
+		err = cli.NetworkConnect(ctx, networkID, r.ID, &endpointSettings)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// copy the userdata file in the container
+	if spec.Init != "" {
+		tmpfile, err := ioutil.TempFile("/tmp", "infrakit")
+		userdataBasename = path.Base(tmpfile.Name())
+		if err != nil {
+			return nil, err
+		}
+
+		defer os.Remove(tmpfile.Name()) // clean up
+
+		if _, err := tmpfile.Write([]byte(spec.Init)); err != nil {
+			return nil, err
+		}
+		if err := tmpfile.Close(); err != nil {
+			return nil, err
+		}
+		srcInfo, err := archive.CopyInfoSourcePath(tmpfile.Name(), false)
+		if err != nil {
+			return nil, err
+		}
+
+		srcArchive, err := archive.TarResource(srcInfo)
+		if err != nil {
+			return nil, err
+		}
+		defer srcArchive.Close()
+		dstDir, preparedArchive, err := archive.PrepareArchiveCopy(srcArchive, srcInfo, archive.CopyInfo{Path: fmt.Sprintf("%s/%s", userdataDirname, userdataBasename)})
+		if err != nil {
+			return nil, err
+		}
+		defer preparedArchive.Close()
+
+		if err := cli.CopyToContainer(ctx, r.ID, dstDir, preparedArchive, apitypes.CopyToContainerOptions{}); err != nil {
+			return nil, err
+		}
+		containerPathStat, err := cli.ContainerStatPath(ctx, r.ID, fmt.Sprintf("%s/%s", userdataDirname, userdataBasename))
+		if err != nil {
+			return nil, err
+		}
+		if containerPathStat.Size != int64(len(spec.Init)) {
+			return nil, fmt.Errorf("userdata has not been properly copied in the container, filename = %s, file size = %d", containerPathStat.Name, containerPathStat.Size)
+		}
+	}
+
+	if err = cli.ContainerStart(ctx, r.ID, apitypes.ContainerStartOptions{}); err != nil {
+		return nil, err
+	}
+
+	if spec.Init != "" {
+		log.Debug("exec the init script")
+		execConfig := apitypes.ExecConfig{Cmd: []string{"/bin/sh", fmt.Sprintf("%s/%s", userdataDirname, userdataBasename)}}
+		idResponse, err := cli.ContainerExecCreate(ctx, r.ID, execConfig)
+		if err != nil {
+			return nil, err
+		}
+		if err = cli.ContainerExecStart(ctx, idResponse.ID, apitypes.ExecStartCheck{}); err != nil {
+			return nil, err
+		}
+		exitCode := 0
+		keepLooping := true
+		for keepLooping {
+			execInspect, err := cli.ContainerExecInspect(ctx, idResponse.ID)
+			if err != nil {
+				log.Warningf("failed to inspect the execution, cmd was: %s", execConfig.Cmd)
+				return nil, err
+			}
+			exitCode = execInspect.ExitCode
+			keepLooping = execInspect.Running
+		}
+		if exitCode != 0 {
+			log.Warningf("failed to exec, cmd was: %s", execConfig.Cmd)
+			return nil, fmt.Errorf("init script failed with code %d", exitCode)
+		}
+		log.Debug("Init script succesfully executed")
+	}
 	return &id, nil
 }
 
@@ -200,6 +315,7 @@ func (p dockerInstancePlugin) Destroy(id instance.ID) error {
 	options := apitypes.ContainerRemoveOptions{Force: true, RemoveVolumes: true, RemoveLinks: false}
 	cli := p.client
 	ctx := context.Background()
+	log.Debugf("Destroying container ID %s", string(id))
 	if err := cli.ContainerRemove(ctx, string(id), options); err != nil {
 		return err
 	}
@@ -233,7 +349,7 @@ func (p dockerInstancePlugin) describeInstances(tags map[string]string) ([]insta
 	}
 
 	descriptions := []instance.Description{}
-	var ns map[string]*network.EndpointSettings
+	//var ns map[string]*network.EndpointSettings
 	for _, container := range containers {
 		tags := map[string]string{}
 		if container.Labels != nil {
@@ -241,23 +357,15 @@ func (p dockerInstancePlugin) describeInstances(tags map[string]string) ([]insta
 				tags[key] = value
 			}
 		}
-		ns = container.NetworkSettings.Networks
-		if ns != nil {
-			for _, eps := range ns {
-				lid := (instance.LogicalID)(eps.IPAddress)
-				descriptions = append(descriptions, instance.Description{
-					ID:        instance.ID(container.ID),
-					LogicalID: &lid,
-					Tags:      tags,
-				})
-				break
-			}
-		} else {
-			descriptions = append(descriptions, instance.Description{
-				ID:   instance.ID(container.ID),
-				Tags: tags,
-			})
+		if len(container.Names) > 1 {
+			log.Debugf("container has %d name(s)", len(container.Names))
 		}
+		lid := (instance.LogicalID)(strings.TrimPrefix(container.Names[0], "/"))
+		descriptions = append(descriptions, instance.Description{
+			ID:        instance.ID(container.ID),
+			LogicalID: &lid,
+			Tags:      tags,
+		})
 	}
 
 	return descriptions, nil

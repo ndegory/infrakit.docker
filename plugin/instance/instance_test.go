@@ -17,11 +17,11 @@ var (
 
 func TestInstanceLifecycle(t *testing.T) {
 	defaultHeaders := map[string]string{"User-Agent": "InfraKit"}
-	cli, err := client.NewClient("unix:///var/run/docker.sock", "1.24", nil, defaultHeaders)
+	cli, err := client.NewClient("unix:///var/run/docker.sock", "1.25", nil, defaultHeaders)
 	require.NoError(t, err)
 
 	pluginImpl := dockerInstancePlugin{client: *cli, namespaceTags: testNamespace}
-	id, err := pluginImpl.Provision(instance.Spec{Properties: inputJSON, Tags: tags})
+	id, err := pluginImpl.Provision(instance.Spec{Properties: inputJSON, Tags: tags, Init: initScript})
 	require.NoError(t, err)
 	require.NotNil(t, id)
 
@@ -30,7 +30,7 @@ func TestInstanceLifecycle(t *testing.T) {
 
 func TestCreateInstanceError(t *testing.T) {
 	defaultHeaders := map[string]string{"User-Agent": "InfraKit"}
-	cli, err := client.NewClient("unix:///var/run/docker.sock", "1.24", nil, defaultHeaders)
+	cli, err := client.NewClient("unix:///var/run/docker.sock", "1.25", nil, defaultHeaders)
 	require.NoError(t, err)
 
 	pluginImpl := NewInstancePlugin(cli, map[string]string{"cluster": "test"})
@@ -43,7 +43,7 @@ func TestCreateInstanceError(t *testing.T) {
 
 func TestDestroyInstanceError(t *testing.T) {
 	defaultHeaders := map[string]string{"User-Agent": "InfraKit"}
-	cli, err := client.NewClient("unix:///var/run/docker.sock", "1.24", nil, defaultHeaders)
+	cli, err := client.NewClient("unix:///var/run/docker.sock", "1.25", nil, defaultHeaders)
 	require.NoError(t, err)
 
 	instanceID := "test-id"
@@ -73,7 +73,7 @@ func TestDescribeInstancesRequest(t *testing.T) {
 
 func TestListGroup(t *testing.T) {
 	defaultHeaders := map[string]string{"User-Agent": "InfraKit"}
-	cli, err := client.NewClient("unix:///var/run/docker.sock", "1.24", nil, defaultHeaders)
+	cli, err := client.NewClient("unix:///var/run/docker.sock", "1.25", nil, defaultHeaders)
 	require.NoError(t, err)
 
 	pluginImpl := NewInstancePlugin(cli, testNamespace)
@@ -85,11 +85,16 @@ func TestListGroup(t *testing.T) {
 var inputJSON = types.AnyString(`{
     "Tags": {"test": "docker-create-test"},
     "Config": {
-        "Image": "docker:dind",
-        "Env": [
-	 "var1=value1",
-	 "var2=value2"
-	]
-    }
+        "Image": "alpine:3.5",
+        "Cmd": ["nc", "-l", "-p", "8080"],
+        "Env": [ "var1=value1", "var2=value2" ]
+    },
+    "NetworkAttachments": [
+        {
+            "Name": "deleteme",
+            "Driver": "overlay"
+        }
+    ]
 }
 `)
+var initScript = "#!/bin/sh\ntouch /tmp/touched"
