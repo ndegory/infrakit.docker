@@ -188,8 +188,8 @@ func (p dockerInstancePlugin) Provision(spec instance.Spec) (*instance.ID, error
 	if r.ID == "" {
 		return nil, errors.New("Unexpected Docker API response")
 	}
-	id := (instance.ID)(r.ID)
-	log.Debugf("Container ID = %s", r.ID)
+	id := (instance.ID)(r.ID[0:12])
+	log.Debugf("Container ID = %s", r.ID[0:12])
 
 	// If a network attachment is specified in the config
 	// attach the container to these networks
@@ -368,7 +368,6 @@ func (p dockerInstancePlugin) describeInstances(tags map[string]string) ([]insta
 	}
 
 	descriptions := []instance.Description{}
-	//var ns map[string]*network.EndpointSettings
 	for _, container := range containers {
 		tags := map[string]string{}
 		if container.Labels != nil {
@@ -381,7 +380,7 @@ func (p dockerInstancePlugin) describeInstances(tags map[string]string) ([]insta
 		}
 		lid := (instance.LogicalID)(strings.TrimPrefix(container.Names[0], "/"))
 		descriptions = append(descriptions, instance.Description{
-			ID:        instance.ID(container.ID),
+			ID:        instance.ID(container.ID[0:12]),
 			LogicalID: &lid,
 			Tags:      tags,
 		})
